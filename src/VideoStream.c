@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/sysctl.h>
+#include <signal.h>
 #endif
 
 // MoonCast: the receive thread's once-a-second diagnostics (LiSetVideoReceiveDiagnostics)
@@ -149,6 +150,20 @@ static void VideoReceiveThreadProc(void* context) {
         encryptedBuffer = NULL;
     }
 
+    // MoonCast: whether this thread blocks SIGTERM (for a terminate that seems ignored), and that diagnostics are on
+    {
+#if defined(__APPLE__)
+        sigset_t mask;
+        pthread_sigmask(SIG_BLOCK, NULL, &mask);
+        fprintf(stderr, "MoonCast: video receive thread: diagnostics %s, SIGTERM %s, SIGINT %s in this thread\n",
+                receiveDiagnostics ? "on" : "off", sigismember(&mask, SIGTERM) ? "blocked" : "not blocked",
+                sigismember(&mask, SIGINT) ? "blocked" : "not blocked");
+#else
+        fprintf(stderr, "MoonCast: video receive thread: diagnostics %s\n", receiveDiagnostics ? "on" : "off");
+#endif
+        fflush(stderr);
+    }
+
 #if defined(__APPLE__)
     // MoonCast: this thread must keep up with PyroWave's bursts (hundreds of packets a frame at hundreds of Mbps):
     // it runs at the highest QoS, like the frame thread
@@ -184,11 +199,12 @@ static void VideoReceiveThreadProc(void* context) {
                 diagDropsAtStart = d;
 #endif
                 uint32_t lost = LiGetVideoUnrecoverableFrames();
-                Limelog("Video receive %.2f s: %u packets, %.1f Mbps, %u missing by RTP sequence (%u out of order), "
+                fprintf(stderr, "MoonCast: video receive %.2f s: %u packets, %.1f Mbps, %u missing by RTP sequence (%u out of order), "
                         "%lld dropped by the system for a full socket buffer, longest pause %.1f ms, longest packet work %.2f ms, "
                         "most waiting in the socket %d KB, %u frames unrecoverable, decode queue up to %d\n",
                         secs, diagPackets, diagBytes * 8 / secs / 1000000.0, diagSeqGaps, diagSeqBack, (long long)drops,
                         diagMaxPauseUs / 1000.0, diagMaxWorkUs / 1000.0, diagMaxQueued / 1024, lost - diagLostAtStart, diagMaxPending);
+                fflush(stderr);
                 diagStartUs = nowUs;
                 diagPackets = diagSeqGaps = diagSeqBack = 0;
                 diagBytes = 0;
