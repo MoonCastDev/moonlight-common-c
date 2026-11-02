@@ -1,5 +1,32 @@
 #include "Limelight-internal.h"
 
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <sys/ioctl.h>
+#include <sys/sysctl.h>
+#endif
+
+// MoonCast: the receive thread's once-a-second diagnostics (LiSetVideoReceiveDiagnostics)
+static bool receiveDiagnostics;
+
+void LiSetVideoReceiveDiagnostics(bool enabled) {
+    receiveDiagnostics = enabled;
+}
+
+#if defined(__APPLE__)
+// The system's count of UDP datagrams dropped for a full socket buffer, or -1 where it can't be read
+static int64_t udpFullSocketDrops(void) {
+    // struct udpstat (netinet/udp_var.h, not in the iOS SDK) starts with seven 32-bit counters, the 7th being
+    // udps_fullsock
+    uint32_t st[64];
+    size_t len = sizeof(st);
+    if (sysctlbyname("net.inet.udp.stats", st, &len, NULL, 0) != 0 || len < 7 * sizeof(uint32_t)) {
+        return -1;
+    }
+    return st[6];
+}
+#endif
+
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
 
@@ -122,9 +149,54 @@ static void VideoReceiveThreadProc(void* context) {
         encryptedBuffer = NULL;
     }
 
+#if defined(__APPLE__)
+    // MoonCast: this thread must keep up with PyroWave's bursts (hundreds of packets a frame at hundreds of Mbps):
+    // it runs at the highest QoS, like the frame thread
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+
+    // MoonCast: diagnostics (LiSetVideoReceiveDiagnostics)
+    uint64_t diagStartUs = PltGetMicroseconds(), diagLastRecvUs = 0, diagMaxPauseUs = 0, diagMaxWorkUs = 0;
+    uint32_t diagPackets = 0, diagSeqGaps = 0, diagSeqBack = 0, diagLostAtStart = LiGetVideoUnrecoverableFrames();
+    uint64_t diagBytes = 0;
+    int diagMaxQueued = 0, diagMaxPending = 0;
+    uint16_t diagLastSeq = 0;
+    bool diagHaveSeq = false;
+#if defined(__APPLE__)
+    int64_t diagDropsAtStart = receiveDiagnostics ? udpFullSocketDrops() : -1;
+#else
+    int64_t diagDropsAtStart = -1;
+#endif
+
     waitingForVideoMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
+        uint64_t diagRecvUs = 0;
+
+        if (receiveDiagnostics) {
+            uint64_t nowUs = PltGetMicroseconds();
+            if (nowUs - diagStartUs >= 1000000) {
+                double secs = (nowUs - diagStartUs) / 1000000.0;
+                int64_t drops = -1;
+#if defined(__APPLE__)
+                int64_t d = udpFullSocketDrops();
+                if (d >= 0 && diagDropsAtStart >= 0) drops = d - diagDropsAtStart;
+                diagDropsAtStart = d;
+#endif
+                uint32_t lost = LiGetVideoUnrecoverableFrames();
+                Limelog("Video receive %.2f s: %u packets, %.1f Mbps, %u missing by RTP sequence (%u out of order), "
+                        "%lld dropped by the system for a full socket buffer, longest pause %.1f ms, longest packet work %.2f ms, "
+                        "most waiting in the socket %d KB, %u frames unrecoverable, decode queue up to %d\n",
+                        secs, diagPackets, diagBytes * 8 / secs / 1000000.0, diagSeqGaps, diagSeqBack, (long long)drops,
+                        diagMaxPauseUs / 1000.0, diagMaxWorkUs / 1000.0, diagMaxQueued / 1024, lost - diagLostAtStart, diagMaxPending);
+                diagStartUs = nowUs;
+                diagPackets = diagSeqGaps = diagSeqBack = 0;
+                diagBytes = 0;
+                diagMaxPauseUs = diagMaxWorkUs = 0;
+                diagMaxQueued = diagMaxPending = 0;
+                diagLostAtStart = lost;
+            }
+        }
 
         if (buffer == NULL) {
             buffer = (char*)malloc(bufferSize);
@@ -158,6 +230,29 @@ static void VideoReceiveThreadProc(void* context) {
 
             // Receive timed out; try again
             continue;
+        }
+
+        if (receiveDiagnostics) {
+            diagRecvUs = PltGetMicroseconds();
+            if (diagLastRecvUs != 0 && diagRecvUs - diagLastRecvUs > diagMaxPauseUs) {
+                diagMaxPauseUs = diagRecvUs - diagLastRecvUs;
+            }
+            diagLastRecvUs = diagRecvUs;
+            diagPackets++;
+            diagBytes += err;
+#if defined(__APPLE__)
+            // what's still waiting in the socket, every 64th packet
+            if ((diagPackets & 63) == 0) {
+                int queued = 0;
+                if (ioctl(rtpSocket, FIONREAD, &queued) == 0 && queued > diagMaxQueued) {
+                    diagMaxQueued = queued;
+                }
+                int pending = LiGetPendingVideoFrames();
+                if (pending > diagMaxPending) {
+                    diagMaxPending = pending;
+                }
+            }
+#endif
         }
 
         if (!receivedDataFromPeer) {
@@ -228,7 +323,31 @@ static void VideoReceiveThreadProc(void* context) {
         packet->timestamp = BE32(packet->timestamp);
         packet->ssrc = BE32(packet->ssrc);
 
+        if (receiveDiagnostics) {
+            // gaps in the RTP sequence: packets that never reached this socket
+            if (diagHaveSeq) {
+                uint16_t step = (uint16_t)(packet->sequenceNumber - diagLastSeq);
+                if (step == 0 || step > 0x8000) {
+                    diagSeqBack++;
+                }
+                else {
+                    diagSeqGaps += step - 1;
+                }
+            }
+            if (!diagHaveSeq || (uint16_t)(packet->sequenceNumber - diagLastSeq) < 0x8000) {
+                diagLastSeq = packet->sequenceNumber;
+            }
+            diagHaveSeq = true;
+        }
+
         queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
+
+        if (receiveDiagnostics) {
+            uint64_t workUs = PltGetMicroseconds() - diagRecvUs;
+            if (workUs > diagMaxWorkUs) {
+                diagMaxWorkUs = workUs;
+            }
+        }
 
         if (queueStatus == RTPF_RET_QUEUED) {
             // The queue owns the buffer

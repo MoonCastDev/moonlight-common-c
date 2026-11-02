@@ -1,5 +1,18 @@
 #include "Limelight-internal.h"
 
+// MoonCast: frames the queue gave up on. At hundreds of Mbps a bad link loses most frames, and a log line for each
+// (written on the receive thread) only makes it worse: the first 20 are logged, then every 100th.
+static uint32_t unrecoverableFrames;
+
+uint32_t LiGetVideoUnrecoverableFrames(void) {
+    return unrecoverableFrames;
+}
+
+static bool logThisLoss(void) {
+    uint32_t n = ++unrecoverableFrames;
+    return n <= 20 || n % 100 == 0;
+}
+
 #include <rs.h>
 
 #if defined(LC_DEBUG) && !defined(LC_FUZZING)
@@ -598,7 +611,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
             reportFinalFrameFecStatus(queue);
 
             if (queue->multiFecLastBlockNumber != 0) {
-                Limelog("Unrecoverable frame %d (block %d of %d): %d+%d=%d received < %d needed\n",
+                if (logThisLoss()) Limelog("Unrecoverable frame %d (block %d of %d): %d+%d=%d received < %d needed\n",
                         queue->currentFrameNumber, queue->multiFecCurrentBlockNumber+1,
                         queue->multiFecLastBlockNumber+1,
                         queue->receivedDataPackets,
@@ -628,7 +641,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
                 }
             }
             else {
-                Limelog("Unrecoverable frame %d: %d+%d=%d received < %d needed\n",
+                if (logThisLoss()) Limelog("Unrecoverable frame %d: %d+%d=%d received < %d needed\n",
                         queue->currentFrameNumber, queue->receivedDataPackets,
                         queue->receivedParityPackets,
                         queue->pendingFecBlockList.count,
@@ -643,7 +656,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
             // Report the final status of the FEC queue before dropping this frame
             reportFinalFrameFecStatus(queue);
 
-            Limelog("Unrecoverable frame %d: lost FEC blocks %d to %d\n",
+            if (logThisLoss()) Limelog("Unrecoverable frame %d: lost FEC blocks %d to %d\n",
                     nvPacket->frameIndex,
                     expectedFecBlockNumber + 1,
                     fecCurrentBlockNumber);
