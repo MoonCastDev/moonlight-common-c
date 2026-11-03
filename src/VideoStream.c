@@ -14,6 +14,15 @@ void LiSetVideoReceiveDiagnostics(bool enabled) {
     receiveDiagnostics = enabled;
 }
 
+// MoonCast: the stream's totals so far (written by the receive thread only)
+static volatile uint64_t totalPackets, totalBytes, totalMissing;
+
+void LiGetVideoReceiveTotals(uint64_t* packets, uint64_t* bytes, uint64_t* missing) {
+    *packets = totalPackets;
+    *bytes = totalBytes;
+    *missing = totalMissing;
+}
+
 #if defined(__APPLE__)
 // The system's count of UDP datagrams dropped for a full socket buffer, or -1 where it can't be read
 static int64_t udpFullSocketDrops(void) {
@@ -71,6 +80,7 @@ void initializeVideoStream(void) {
     receivedDataFromPeer = false;
     firstDataTimeMs = 0;
     receivedFullFrame = false;
+    totalPackets = totalBytes = totalMissing = 0;
 }
 
 // Clean up the video stream
@@ -248,6 +258,9 @@ static void VideoReceiveThreadProc(void* context) {
             continue;
         }
 
+        totalPackets++;
+        totalBytes += err;
+
         if (receiveDiagnostics) {
             diagRecvUs = PltGetMicroseconds();
             if (diagLastRecvUs != 0 && diagRecvUs - diagLastRecvUs > diagMaxPauseUs) {
@@ -339,22 +352,21 @@ static void VideoReceiveThreadProc(void* context) {
         packet->timestamp = BE32(packet->timestamp);
         packet->ssrc = BE32(packet->ssrc);
 
-        if (receiveDiagnostics) {
-            // gaps in the RTP sequence: packets that never reached this socket
-            if (diagHaveSeq) {
-                uint16_t step = (uint16_t)(packet->sequenceNumber - diagLastSeq);
-                if (step == 0 || step > 0x8000) {
-                    diagSeqBack++;
-                }
-                else {
-                    diagSeqGaps += step - 1;
-                }
+        // gaps in the RTP sequence: packets that never reached this socket (always counted: the totals)
+        if (diagHaveSeq) {
+            uint16_t step = (uint16_t)(packet->sequenceNumber - diagLastSeq);
+            if (step == 0 || step > 0x8000) {
+                diagSeqBack++;
             }
-            if (!diagHaveSeq || (uint16_t)(packet->sequenceNumber - diagLastSeq) < 0x8000) {
-                diagLastSeq = packet->sequenceNumber;
+            else {
+                diagSeqGaps += step - 1;
+                totalMissing += step - 1;
             }
-            diagHaveSeq = true;
         }
+        if (!diagHaveSeq || (uint16_t)(packet->sequenceNumber - diagLastSeq) < 0x8000) {
+            diagLastSeq = packet->sequenceNumber;
+        }
+        diagHaveSeq = true;
 
         queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
 

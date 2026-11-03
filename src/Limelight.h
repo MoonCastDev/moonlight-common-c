@@ -1030,6 +1030,10 @@ const char* LiGetHostPyroWaveBitstreamId(void);
 // depth. For diagnosing high-bitrate streams; off by default. Call before LiStartConnection(). (MoonCast)
 void LiSetVideoReceiveDiagnostics(bool enabled);
 
+// The video stream's totals since it started: packets and bytes that reached the socket, and packets missing by
+// RTP sequence (lost before the socket). (MoonCast)
+void LiGetVideoReceiveTotals(uint64_t* packets, uint64_t* bytes, uint64_t* missing);
+
 // Unrecoverable frames counted by the RTP video queue since the stream started. (MoonCast)
 uint32_t LiGetVideoUnrecoverableFrames(void);
 
