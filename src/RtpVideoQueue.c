@@ -8,6 +8,10 @@ uint32_t LiGetVideoUnrecoverableFrames(void) {
     return unrecoverableFrames;
 }
 
+void RtpvResetUnrecoverableFrames(void) {
+    unrecoverableFrames = 0;
+}
+
 static bool logThisLoss(void) {
     uint32_t n = ++unrecoverableFrames;
     return n <= 20 || n % 100 == 0;

@@ -14,6 +14,8 @@ void LiSetVideoReceiveDiagnostics(bool enabled) {
     receiveDiagnostics = enabled;
 }
 
+void RtpvResetUnrecoverableFrames(void);
+
 // MoonCast: the stream's totals so far (written by the receive thread only)
 static volatile uint64_t totalPackets, totalBytes, totalMissing;
 
@@ -81,6 +83,7 @@ void initializeVideoStream(void) {
     firstDataTimeMs = 0;
     receivedFullFrame = false;
     totalPackets = totalBytes = totalMissing = 0;
+    RtpvResetUnrecoverableFrames();
 }
 
 // Clean up the video stream
@@ -187,6 +190,7 @@ static void VideoReceiveThreadProc(void* context) {
     int diagMaxQueued = 0, diagMaxPending = 0;
     uint16_t diagLastSeq = 0;
     bool diagHaveSeq = false;
+    uint32_t skippedSinceSeq = 0;
 #if defined(__APPLE__)
     int64_t diagDropsAtStart = receiveDiagnostics ? udpFullSocketDrops() : -1;
 #else
@@ -302,7 +306,8 @@ static void VideoReceiveThreadProc(void* context) {
 #endif
 
         if (err < minSize) {
-            // Runt packet
+            // Runt packet (arrived: not missing)
+            skippedSinceSeq++;
             continue;
         }
 
@@ -332,6 +337,8 @@ static void VideoReceiveThreadProc(void* context) {
             // traffic away (as mentioned in the paragraph above) and continue accepting
             // legitmate video traffic.
             if (encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&rtpQueue)) {
+                // MoonCast: arrived, so not missing: the next sequence gap leaves it out
+                skippedSinceSeq++;
                 continue;
             }
 
@@ -342,6 +349,7 @@ static void VideoReceiveThreadProc(void* context) {
                                    ((unsigned char*)(encHeader + 1)), err - sizeof(ENC_VIDEO_HEADER), // The ciphertext is after the header
                                    (unsigned char*)buffer, &err)) {
                 Limelog("Failed to decrypt video packet!\n");
+                skippedSinceSeq++;
                 continue;
             }
         }
@@ -352,21 +360,28 @@ static void VideoReceiveThreadProc(void* context) {
         packet->timestamp = BE32(packet->timestamp);
         packet->ssrc = BE32(packet->ssrc);
 
-        // gaps in the RTP sequence: packets that never reached this socket (always counted: the totals)
+        // gaps in the RTP sequence: packets that never reached this socket (always counted: the totals). Packets
+        // that did arrive but were dropped before decryption (an old frame's FEC shards) aren't missing: as on
+        // Android (moonlight-common-c 1bdb3ca, skippedSinceSeq), they come off the gap.
         if (diagHaveSeq) {
             uint16_t step = (uint16_t)(packet->sequenceNumber - diagLastSeq);
-            if (step == 0 || step > 0x8000) {
+            if (step == 0 || step >= 0x8000) {
                 diagSeqBack++;
             }
             else {
-                diagSeqGaps += step - 1;
-                totalMissing += step - 1;
+                uint32_t gap = step - 1;
+                gap = gap > skippedSinceSeq ? gap - skippedSinceSeq : 0;
+                diagSeqGaps += gap;
+                totalMissing += gap;
+                diagLastSeq = packet->sequenceNumber;
+                skippedSinceSeq = 0;
             }
         }
-        if (!diagHaveSeq || (uint16_t)(packet->sequenceNumber - diagLastSeq) < 0x8000) {
+        else {
             diagLastSeq = packet->sequenceNumber;
+            diagHaveSeq = true;
+            skippedSinceSeq = 0;
         }
-        diagHaveSeq = true;
 
         queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
 
