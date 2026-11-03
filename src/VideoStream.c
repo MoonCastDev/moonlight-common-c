@@ -1,5 +1,22 @@
 #include "Limelight-internal.h"
 
+#if defined(__ANDROID__) || defined(__linux__)
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+// MoonCast: the stream's totals so far (written by the receive thread only), LiGetVideoReceiveTotals()
+static volatile uint64_t totalPackets, totalBytes, totalMissing;
+
+void LiGetVideoReceiveTotals(uint64_t* packets, uint64_t* bytes, uint64_t* missing) {
+    *packets = totalPackets;
+    *bytes = totalBytes;
+    *missing = totalMissing;
+}
+
+void RtpvResetUnrecoverableFrames(void);
+
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
 
@@ -43,6 +60,8 @@ void initializeVideoStream(void) {
     receivedDataFromPeer = false;
     firstDataTimeMs = 0;
     receivedFullFrame = false;
+    totalPackets = totalBytes = totalMissing = 0;
+    RtpvResetUnrecoverableFrames();
 }
 
 // Clean up the video stream
@@ -122,6 +141,20 @@ static void VideoReceiveThreadProc(void* context) {
         encryptedBuffer = NULL;
     }
 
+#if defined(__ANDROID__) || defined(__linux__)
+    // MoonCast: this thread must keep up with bursts of hundreds of packets a frame (PyroWave, high bitrates): it
+    // runs above normal priority (Android's THREAD_PRIORITY_URGENT_DISPLAY, which an app may use)
+    if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), -8) != 0) {
+        Limelog("Video Receive: couldn't raise the thread's priority: %d\n", errno);
+    }
+#endif
+
+    // MoonCast: gaps in the RTP sequence (packets that never reached the socket), for LiGetVideoReceiveTotals().
+    // Packets dropped here before decryption (an old frame's FEC shards) are not missing: they're subtracted.
+    uint16_t lastSeq = 0;
+    bool haveSeq = false;
+    uint32_t skippedSinceSeq = 0;
+
     waitingForVideoMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
@@ -159,6 +192,9 @@ static void VideoReceiveThreadProc(void* context) {
             // Receive timed out; try again
             continue;
         }
+
+        totalPackets++;
+        totalBytes += err;
 
         if (!receivedDataFromPeer) {
             receivedDataFromPeer = true;
@@ -208,6 +244,7 @@ static void VideoReceiveThreadProc(void* context) {
             // traffic away (as mentioned in the paragraph above) and continue accepting
             // legitmate video traffic.
             if (encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&rtpQueue)) {
+                skippedSinceSeq++;
                 continue;
             }
 
@@ -227,6 +264,22 @@ static void VideoReceiveThreadProc(void* context) {
         packet->sequenceNumber = BE16(packet->sequenceNumber);
         packet->timestamp = BE32(packet->timestamp);
         packet->ssrc = BE32(packet->ssrc);
+
+        // MoonCast: packets missing by RTP sequence
+        if (haveSeq) {
+            uint16_t step = (uint16_t)(packet->sequenceNumber - lastSeq);
+            if (step != 0 && step < 0x8000) {
+                uint32_t gap = step - 1;
+                totalMissing += gap > skippedSinceSeq ? gap - skippedSinceSeq : 0;
+                lastSeq = packet->sequenceNumber;
+                skippedSinceSeq = 0;
+            }
+        }
+        else {
+            lastSeq = packet->sequenceNumber;
+            haveSeq = true;
+            skippedSinceSeq = 0;
+        }
 
         queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
 

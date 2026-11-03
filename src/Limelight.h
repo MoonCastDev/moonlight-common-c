@@ -1019,6 +1019,13 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata);
 // center. Valid after the RTSP handshake. This is a Sunshine protocol extension.
 const char* LiGetHostPyroWaveBitstreamId(void);
 
+// The video stream's totals since it started: packets and bytes that reached the socket, and packets missing by
+// RTP sequence (lost before the socket). For a client that adapts its bitrate to the link. (MoonCast)
+void LiGetVideoReceiveTotals(uint64_t* packets, uint64_t* bytes, uint64_t* missing);
+
+// Unrecoverable frames counted by the RTP video queue since the stream started. (MoonCast)
+uint32_t LiGetVideoUnrecoverableFrames(void);
+
 // This function requests an IDR frame from the host. Typically this is done using DR_NEED_IDR, but clients
 // processing frames asynchronously may need to reset their decoder state even after returning DR_OK for
 // the prior frame. Rather than wait for a new frame and return DR_NEED_IDR for that one, they can just
